@@ -1,0 +1,3277 @@
+<script>
+/* =========================================
+   APRENDE+ | APLICACIÓN PRINCIPAL
+========================================= */
+
+const App = {
+  teacherToken: sessionStorage.getItem('aprende_teacher_token') || '',
+  teacher: null,
+  teacherData: null,
+  selectedTeacherStudent: null,
+  token: sessionStorage.getItem('aprende_token') || '',
+  student: null,
+  activities: [],
+  dashboard: null,
+  currentActivity: null,
+  currentPage: 'home',
+  currentFilter: 'Todos',
+  recorder: null,
+  audioChunks: [],
+  audioBlob: null,
+  audioUrl: null,
+  recordingStream: null,
+  recordingSkill: null,
+  activityResults: {},
+  speechUtterance: null,
+  recorderWindow: null,
+  recorderOrigin: null,
+  recorderProcessing: false
+};
+
+
+/* =========================================
+   ICONOS Y UTILIDADES
+========================================= */
+
+function icon(name, size = 20, extraClass = '') {
+  return `<i data-lucide="${name}" width="${size}" height="${size}" class="${extraClass}" aria-hidden="true"></i>`;
+}
+
+function refreshIcons() {
+  if (window.lucide) {
+    lucide.createIcons({ attrs: { 'stroke-width': 1.8 } });
+  }
+}
+
+function getSkillIcon(skill) {
+  return {
+    Listening: 'headphones',
+    Speaking: 'mic',
+    Reading: 'book-open',
+    Writing: 'pen-line'
+  }[skill] || 'book';
+}
+
+function getSkillClass(skill) {
+  return 'tag-' + String(skill || '').toLowerCase();
+}
+
+function getInitials(name) {
+  return String(name || 'Estudiante')
+    .split(' ')
+    .map(part => part.charAt(0))
+    .slice(0, 2)
+    .join('')
+    .toUpperCase();
+}
+
+function skillIconHTML(skill, size = 22) {
+  return `<span class="icon-wrapper ${getSkillClass(skill)}">${icon(getSkillIcon(skill), size)}</span>`;
+}
+
+function escapeHTML(value) {
+  return String(value == null ? '' : value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+function showToast(message, type) {
+  const container = document.getElementById('toast-container');
+  if (!container) return;
+
+  const toast = document.createElement('div');
+  toast.className = 'toast ' + (type || '');
+
+  const toastIcon = type === 'error'
+    ? 'alert-circle'
+    : type === 'success'
+      ? 'check-circle'
+      : 'info';
+
+  toast.innerHTML = `${icon(toastIcon, 18)}<span>${escapeHTML(message)}</span>`;
+  container.appendChild(toast);
+  refreshIcons();
+
+  setTimeout(() => toast.remove(), 3500);
+}
+
+function hideLoading() {
+  document.getElementById('loading-screen').classList.add('hidden');
+  document.getElementById('main-app').classList.remove('hidden');
+}
+
+function showLoading() {
+  document.getElementById('loading-screen').classList.remove('hidden');
+  document.getElementById('main-app').classList.add('hidden');
+}
+
+function serverCall(functionName, args, success, failure) {
+  let runner = google.script.run
+    .withFailureHandler(function(error) {
+      console.error(error);
+      if (failure) failure(error);
+      else showToast('Ocurrió un error de comunicación.', 'error');
+    })
+    .withSuccessHandler(function(result) {
+      if (success) success(result);
+    });
+
+  runner[functionName].apply(runner, args || []);
+}
+
+
+function readableFeedback(feedback) {
+  if (!feedback) return '';
+
+  let value = feedback;
+
+  // Intentar interpretar cadenas que contienen JSON.
+  if (typeof value === 'string') {
+    value = value.trim();
+
+    if (!value) return '';
+
+    if (
+      (value.startsWith('[') && value.endsWith(']')) ||
+      (value.startsWith('{') && value.endsWith('}'))
+    ) {
+      try {
+        value = JSON.parse(value);
+      } catch (error) {
+        return value;
+      }
+    } else {
+      return value;
+    }
+  }
+
+  // Si el resultado es una lista de respuestas.
+  if (Array.isArray(value)) {
+    const total = value.length;
+
+    const correct = value.filter(item =>
+      item && (
+        item.correct === true ||
+        item.isCorrect === true
+      )
+    ).length;
+
+    if (total > 0) {
+      return `Respondiste correctamente ${correct} de ${total} preguntas.`;
+    }
+
+    return '';
+  }
+
+  // Si es un objeto con información de evaluación.
+  if (typeof value === 'object') {
+    if (typeof value.message === 'string') {
+      return value.message;
+    }
+
+    if (typeof value.summary === 'string') {
+      return value.summary;
+    }
+
+    if (typeof value.feedback === 'string') {
+      return readableFeedback(value.feedback);
+    }
+  }
+
+  return '';
+}
+
+
+
+/* =========================================
+   ACTIVIDADES COMBINADAS
+========================================= */
+
+function getActivitySkills(activity) {
+  if (!activity) return [];
+
+  if (activity.parts && Object.keys(activity.parts).length) {
+    return Object.keys(activity.parts);
+  }
+
+  if (Array.isArray(activity.skills) && activity.skills.length) {
+    return activity.skills;
+  }
+
+  return activity.skill ? [activity.skill] : [];
+}
+
+function getActivityPart(activity, skill) {
+  if (activity && activity.parts && activity.parts[skill]) {
+    return activity.parts[skill];
+  }
+
+  return {
+    instructions: activity.instructions || '',
+    content: activity.content || '',
+    prompt: activity.content || '',
+    questions: activity.questions || []
+  };
+}
+
+function getSkillResult(activityId, skill) {
+  return (App.activityResults[activityId] || {})[skill] || null;
+}
+
+/**
+ * Determina si un resultado candidato es más reciente que el guardado.
+ * No depende del orden en que el backend devuelva los registros.
+ */
+function isMoreRecentResult(candidate, current) {
+  if (!candidate) return false;
+  if (!current) return true;
+
+  const candidateDate = candidate.date || candidate.createdAt || candidate.created_at;
+  const currentDate = current.date || current.createdAt || current.created_at;
+
+  if (!candidateDate) return false;
+  if (!currentDate) return true;
+
+  const candidateTime = new Date(candidateDate).getTime();
+  const currentTime = new Date(currentDate).getTime();
+
+  if (!Number.isFinite(candidateTime)) return false;
+  if (!Number.isFinite(currentTime)) return true;
+
+  return candidateTime > currentTime;
+}
+
+function storeLatestActivityResult(activityId, skill, record) {
+  if (!activityId || !skill || !record) return;
+
+  if (!App.activityResults[activityId]) {
+    App.activityResults[activityId] = {};
+  }
+
+  const current = App.activityResults[activityId][skill];
+
+  if (isMoreRecentResult(record, current)) {
+    App.activityResults[activityId][skill] = record;
+  }
+}
+
+function saveLocalActivityResult(activityId, skill, result) {
+  if (!App.activityResults[activityId]) {
+    App.activityResults[activityId] = {};
+  }
+
+  App.activityResults[activityId][skill] = {
+    score: Number(result.score || 0),
+    percentage: Number(
+      result.percentage !== undefined
+        ? result.percentage
+        : result.score || 0
+    ),
+    maxScore: result.maxScore || 100,
+    feedback: result.feedback || '',
+    strengths: Array.isArray(result.strengths) ? result.strengths : [],
+    improvements: Array.isArray(result.improvements) ? result.improvements : [],
+    recommendation: result.recommendation || '',
+    correct: result.correct,
+    total: result.total,
+    date: new Date().toISOString()
+  };
+}
+
+function loadActivityResults(callback) {
+  serverCall(
+    'getProgress',
+    [App.token],
+    function(result) {
+      if (result && result.success) {
+        App.activityResults = {};
+
+        (result.records || []).forEach(function(record) {
+          const activityId = record.activityId;
+          const skill = record.skill;
+
+          if (!activityId || !skill) return;
+
+          storeLatestActivityResult(activityId, skill, record);
+        });
+
+        App.dashboard = result.dashboard || App.dashboard;
+      }
+
+      if (callback) callback();
+    },
+    function() {
+      if (callback) callback();
+    }
+  );
+}
+
+function getActivityCompletion(activity) {
+  const skills = getActivitySkills(activity);
+  const completed = skills.filter(skill =>
+    Boolean(getSkillResult(activity.id, skill))
+  );
+
+  return {
+    total: skills.length,
+    completed: completed.length,
+    pending: skills.filter(skill =>
+      !getSkillResult(activity.id, skill)
+    ),
+    isComplete: skills.length > 0 && completed.length === skills.length
+  };
+}
+
+
+/* =========================================
+   INICIALIZACIÓN
+========================================= */
+
+document.addEventListener('DOMContentLoaded', function() {
+  if (App.token) loadApplication();
+  else if (App.teacherToken) loadTeacherApplication();
+  else showLogin();
+});
+
+/* =========================================
+   INTEGRACIÓN CON GRABADOR DE GITHUB PAGES
+========================================= */
+
+const RECORDER_URL = 'https://diegojgv30.github.io/grabadorAprende-/';
+
+window.addEventListener('message', handleRecorderMessage);
+
+function handleRecorderMessage(event) {
+  // Solo aceptar mensajes de la ventana que abrió Aprende+.
+  if (!App.recorderWindow || event.source !== App.recorderWindow) return;
+
+  // Verificar el origen del grabador.
+  if (event.origin !== 'https://diegojgv30.github.io') return;
+
+  const data = event.data || {};
+
+  if (data.app !== 'APRENDE_PLUS_RECORDER') return;
+
+  // El grabador informa que está listo.
+  if (data.type === 'RECORDER_READY') {
+    if (!App.currentActivity) return;
+
+    App.recorderOrigin = event.origin;
+
+    App.recorderWindow.postMessage({
+      app: 'APRENDE_PLUS_RECORDER',
+      type: 'RECORDER_INIT',
+      token: App.token,
+      activityId: App.currentActivity.id
+    }, App.recorderOrigin);
+
+    const status = document.getElementById('recorder-status');
+
+    if (status) {
+      status.textContent = 'Grabador conectado. Completa tu grabación en la otra pestaña.';
+    }
+
+    return;
+  }
+
+  // El grabador envía el audio.
+  if (data.type === 'RECORDER_AUDIO') {
+    if (App.recorderProcessing) return;
+
+    if (!App.currentActivity ||
+        data.activityId !== App.currentActivity.id) {
+      showToast('La grabación no corresponde a esta actividad.', 'error');
+      return;
+    }
+
+    if (!data.base64 || !data.mimeType) {
+      showToast('No se recibió un archivo de audio válido.', 'error');
+      return;
+    }
+
+    processRecorderAudio(data.base64, data.mimeType);
+  }
+}
+
+
+/* =========================================
+   ABRIR GRABADOR EXTERNO
+========================================= */
+
+function openRecorder() {
+  if (!App.currentActivity) {
+    showToast('No hay una actividad seleccionada.', 'error');
+    return;
+  }
+
+  if (App.recorderWindow && !App.recorderWindow.closed) {
+    App.recorderWindow.focus();
+    return;
+  }
+
+  // Debe ejecutarse directamente desde el clic del usuario.
+  const popup = window.open(
+    RECORDER_URL,
+    '_blank'
+  );
+
+  if (!popup) {
+    showToast(
+      'El navegador bloqueó la nueva pestaña. Permite las ventanas emergentes para Aprende+.',
+      'error'
+    );
+    return;
+  }
+
+  App.recorderWindow = popup;
+  App.recorderOrigin = null;
+  App.recorderProcessing = false;
+
+  const status = document.getElementById('recorder-status');
+
+  if (status) {
+    status.textContent = 'Esperando conexión con el grabador...';
+  }
+
+  const button = document.getElementById('open-recorder-button');
+
+  if (button) {
+    button.disabled = true;
+    button.innerHTML = 'Grabador abierto';
+  }
+
+  // Comprobar si el usuario cierra la pestaña sin enviar audio.
+  const checkWindow = setInterval(function() {
+    if (!App.recorderWindow || App.recorderWindow.closed) {
+      clearInterval(checkWindow);
+
+      App.recorderWindow = null;
+      App.recorderOrigin = null;
+
+      const currentButton = document.getElementById('open-recorder-button');
+
+      if (currentButton) {
+        currentButton.disabled = false;
+        currentButton.innerHTML = 'Abrir grabador nuevamente';
+      }
+
+      const currentStatus = document.getElementById('recorder-status');
+
+      if (currentStatus && !App.recorderProcessing) {
+        currentStatus.textContent = 'El grabador se cerró. Puedes abrirlo nuevamente.';
+      }
+    }
+  }, 1000);
+}
+
+
+/* =========================================
+   PROCESAR AUDIO RECIBIDO
+========================================= */
+
+function processRecorderAudio(base64, mimeType) {
+  const activity = App.currentActivity;
+
+  if (!activity) return;
+
+  App.recorderProcessing = true;
+
+  const button = document.getElementById('open-recorder-button');
+  const status = document.getElementById('recorder-status');
+
+  if (button) {
+    button.disabled = true;
+    button.innerHTML = 'Evaluando con IA...';
+  }
+
+  if (status) {
+    status.textContent = 'Audio recibido. Evaluando tu pronunciación...';
+  }
+
+  serverCall(
+    'evaluateSpeaking',
+    [
+      App.token,
+      activity.id,
+      base64,
+      mimeType
+    ],
+    function(result) {
+      if (!result || !result.success) {
+        App.recorderProcessing = false;
+
+        if (button) {
+          button.disabled = false;
+          button.innerHTML = 'Abrir grabador nuevamente';
+        }
+
+        if (status) {
+          status.textContent = 'No fue posible evaluar el audio. Intenta nuevamente.';
+        }
+
+        showToast(
+          result ? result.message : 'No fue posible evaluar el audio.',
+          'error'
+        );
+
+        return;
+      }
+
+      saveLocalActivityResult(activity.id, 'Speaking', result);
+
+      if (App.recorderWindow && !App.recorderWindow.closed) {
+        App.recorderWindow.close();
+      }
+
+      App.recorderWindow = null;
+      App.recorderOrigin = null;
+      App.recorderProcessing = false;
+
+      showToast('Speaking completado correctamente.', 'success');
+
+      refreshDashboard(function() {
+        renderActivity(activity);
+      });
+    },
+    function() {
+      App.recorderProcessing = false;
+
+      if (button) {
+        button.disabled = false;
+        button.innerHTML = 'Abrir grabador nuevamente';
+      }
+
+      if (status) {
+        status.textContent = 'Error de comunicación. Intenta nuevamente.';
+      }
+    }
+  );
+}
+
+/* =========================================
+   LOGIN
+========================================= */
+
+function showLogin() {
+  hideLoading();
+
+  document.getElementById('app-content').innerHTML = `
+    <div class="login-layout">
+
+      <section class="login-side">
+
+        <div class="login-brand">
+          <div class="brand-logo" style="position:relative;display:flex;align-items:center;justify-content:center;line-height:1;">
+            <span style="font-size:32px;line-height:1;font-weight:800;">A</span>
+            <span style="position:absolute!important;top:7px!important;right:8px!important;bottom:auto!important;left:auto!important;transform:none!important;font-size:17px!important;line-height:1!important;font-weight:800;color:#8CF0D0;">+</span>
+          </div>
+          <span class="login-brand-name">Aprende+</span>
+        </div>
+
+        <div class="login-hero-content">
+
+          <span class="login-eyebrow">
+            <span class="eyebrow-dot"></span>
+            YOUR LEARNING JOURNEY STARTS HERE
+          </span>
+
+          <h1>
+            Learn English.<br>
+            <span>Discover your potential.</span>
+          </h1>
+
+          <p>
+            Aprende inglés de una manera diferente.
+            Practica, supera desafíos y descubre todo
+            lo que puedes lograr.
+          </p>
+
+          <div class="login-features">
+            <div class="login-feature">${icon('headphones', 20)}<span>Listening</span></div>
+            <div class="login-feature">${icon('mic', 20)}<span>Speaking</span></div>
+            <div class="login-feature">${icon('book-open', 20)}<span>Reading</span></div>
+            <div class="login-feature">${icon('pen-line', 20)}<span>Writing</span></div>
+          </div>
+
+        </div>
+
+        <div class="login-footer">
+          Aprende+ · English Learning Platform
+        </div>
+
+        <div class="login-decoration login-decoration-one"></div>
+        <div class="login-decoration login-decoration-two"></div>
+
+      </section>
+
+      <section class="login-form-side">
+
+        <form class="login-form" id="login-form">
+
+          <div class="login-mobile-brand">
+            <div class="brand-logo" style="position:relative;display:flex;align-items:center;justify-content:center;line-height:1;">
+            <span style="font-size:32px;line-height:1;font-weight:800;">A</span>
+            <span style="position:absolute!important;top:7px!important;right:8px!important;bottom:auto!important;left:auto!important;transform:none!important;font-size:17px!important;line-height:1!important;font-weight:800;color:#8CF0D0;">+</span>
+          </div>
+            <span>Aprende+</span>
+          </div>
+
+          <div class="login-heading-icon">${icon('graduation-cap', 28)}</div>
+
+          <span class="login-overline">BIENVENIDO DE NUEVO</span>
+          <h2>Inicia sesión</h2>
+
+          <p>
+            Ingresa tus datos para acceder a tu espacio de aprendizaje.
+          </p>
+
+          <div class="form-group">
+            <label class="form-label" for="student-code">
+              Código de estudiante
+            </label>
+
+            <div class="input-wrapper">
+              ${icon('user-round', 19)}
+              <input class="form-input" id="student-code"
+                type="text" placeholder="Ingresa tu código de estudiante"
+                autocomplete="username" required>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label" for="student-pin">
+              PIN de acceso
+            </label>
+
+            <div class="input-wrapper">
+              ${icon('lock-keyhole', 19)}
+              <input class="form-input" id="student-pin"
+                type="password" placeholder="Ingresa tu PIN"
+                autocomplete="current-password" required>
+            </div>
+          </div>
+
+          <button class="btn btn-primary btn-block login-submit"
+            id="login-button" type="submit">
+            <span>Iniciar sesión</span>
+            ${icon('arrow-right', 19)}
+          </button>
+
+          <div class="login-security-note">
+            Solicita tu código de acceso y PIN a tu docente.
+          </div>
+
+          <div class="login-security">
+            ${icon('shield-check', 15)}
+            Acceso seguro para estudiantes
+          </div>
+
+          <style>
+            .login-form .teacher-access {
+              margin-top: 22px;
+              padding: 18px 20px 0;
+              border-top: 1px solid #e8edf5;
+              text-align: left;
+            }
+            .login-form .teacher-access-toggle {
+              display: flex;
+              align-items: center;
+              justify-content: flex-start;
+              gap: 10px;
+              width: 100%;
+              padding: 12px 0;
+              border: 0;
+              background: transparent;
+              color: #4146c8;
+              font: inherit;
+              font-size: 15px;
+              font-weight: 700;
+              cursor: pointer;
+              text-align: left;
+            }
+            .login-form .teacher-access-toggle:hover { color: #292da8; }
+            .login-form .teacher-login-panel {
+              margin-top: 8px;
+              padding: 18px;
+              border: 1px solid #e5e9f5;
+              border-radius: 14px;
+              background: #f8f9ff;
+              text-align: left;
+            }
+            .login-form .teacher-login-panel.hidden { display: none !important; }
+            .login-form .teacher-login-panel .form-label {
+              display: block;
+              margin-bottom: 8px;
+              color: #29324a;
+              font-size: 13px;
+              font-weight: 650;
+            }
+            .login-form .teacher-login-panel .input-wrapper { margin-bottom: 14px; }
+            .login-form .teacher-login-panel .btn { width: 100%; }
+            @media(max-width:600px) {
+              .login-form .teacher-access { padding-left: 4px; padding-right: 4px; }
+              .login-form .teacher-login-panel { padding: 14px; }
+            }
+          </style>
+
+          <div class="teacher-access">
+            <button type="button" class="teacher-access-toggle"
+              onclick="toggleTeacherLogin()" aria-expanded="false"
+              aria-controls="teacher-login-panel">
+              ${icon('graduation-cap', 19)}
+              <span>Acceso para docentes</span>
+              ${icon('chevron-down', 16)}
+            </button>
+
+            <div id="teacher-login-panel" class="teacher-login-panel hidden">
+              <label class="form-label" for="teacher-password">Contraseña docente</label>
+              <div class="input-wrapper">
+                ${icon('lock-keyhole', 19)}
+                <input class="form-input" id="teacher-password"
+                  type="password" autocomplete="current-password"
+                  placeholder="Ingresa tu contraseña">
+              </div>
+              <button type="button" class="btn btn-primary btn-block mt-20"
+                id="teacher-login-button" onclick="handleTeacherLogin()">
+                <span>Ingresar al panel docente</span>
+                ${icon('arrow-right', 18)}
+              </button>
+            </div>
+          </div>
+
+        </form>
+
+      </section>
+
+    </div>
+  `;
+
+  document.getElementById('login-form')
+    .addEventListener('submit', handleLogin);
+
+  const teacherPassword = document.getElementById('teacher-password');
+  if (teacherPassword) {
+    teacherPassword.addEventListener('keydown', function(event) {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        handleTeacherLogin();
+      }
+    });
+  }
+
+  refreshIcons();
+}
+
+function handleLogin(event) {
+  event.preventDefault();
+
+  const code = document.getElementById('student-code').value;
+  const pin = document.getElementById('student-pin').value;
+  const button = document.getElementById('login-button');
+
+  button.disabled = true;
+  button.innerHTML = `<span>Ingresando...</span>${icon('loader-circle', 19)}`;
+  refreshIcons();
+
+  serverCall(
+    'loginStudent',
+    [code, pin],
+    function(result) {
+      button.disabled = false;
+
+      if (!result || !result.success) {
+        button.innerHTML = `<span>Iniciar sesión</span>${icon('arrow-right', 19)}`;
+        refreshIcons();
+        showToast(result ? result.message : 'No fue posible iniciar sesión.', 'error');
+        return;
+      }
+
+      App.token = result.token;
+      App.student = result.student;
+
+      sessionStorage.setItem('aprende_token', result.token);
+      loadApplication();
+    },
+    function() {
+      button.disabled = false;
+      button.innerHTML = `<span>Iniciar sesión</span>${icon('arrow-right', 19)}`;
+      refreshIcons();
+    }
+  );
+}
+
+
+/* =========================================
+   CARGA DE LA APLICACIÓN
+========================================= */
+
+function loadApplication() {
+  showLoading();
+
+  serverCall(
+    'getAppData',
+    [App.token],
+    function(result) {
+      if (!result || !result.success) {
+        sessionStorage.removeItem('aprende_token');
+        App.token = '';
+        showLogin();
+        return;
+      }
+
+      App.student = result.student;
+      App.activities = result.activities || [];
+      App.dashboard = result.dashboard || {};
+      App.activityResults = {};
+
+      loadActivityResults(function() {
+        renderLayout();
+        navigate('home');
+        hideLoading();
+      });
+    },
+    function() {
+      sessionStorage.removeItem('aprende_token');
+      App.token = '';
+      showLogin();
+    }
+  );
+}
+
+
+
+function ensureMobileLogoutStyles() {
+  if (document.getElementById('mobile-logout-styles')) return;
+  const style = document.createElement('style');
+  style.id = 'mobile-logout-styles';
+  style.textContent = `
+    .mobile-logout-item { display: none !important; }
+    @media (max-width: 760px) {
+      .mobile-logout-item {
+        display: flex !important;
+        color: #c65353 !important;
+        background: transparent !important;
+        cursor: pointer;
+        touch-action: manipulation;
+      }
+      .mobile-logout-item i { color: #c65353 !important; }
+      .mobile-logout-item:active { background: #fff0f0 !important; }
+    }
+  `;
+  document.head.appendChild(style);
+}
+
+/* =========================================
+   ESTRUCTURA GENERAL
+========================================= */
+
+function renderLayout() {
+  const name = escapeHTML(App.student.name);
+  const grade = escapeHTML(App.student.grade);
+
+  document.getElementById('app-content').innerHTML = `
+    <div class="app-layout">
+
+      <aside class="sidebar">
+
+        <div class="brand">
+          <div class="brand-logo" style="position:relative;display:flex;align-items:center;justify-content:center;line-height:1;">
+            <span style="font-size:32px;line-height:1;font-weight:800;">A</span>
+            <span style="position:absolute!important;top:7px!important;right:8px!important;bottom:auto!important;left:auto!important;transform:none!important;font-size:17px!important;line-height:1!important;font-weight:800;color:#8CF0D0;">+</span>
+          </div>
+          <div class="brand-name">Aprende<span>+</span></div>
+        </div>
+
+        <div class="nav-label">MENÚ PRINCIPAL</div>
+
+        <nav class="nav-menu">
+
+          <button class="nav-item active" data-page="home">
+            ${icon('layout-dashboard', 20)}
+            <span>Inicio</span>
+          </button>
+
+          <button class="nav-item" data-page="missions">
+            ${icon('target', 20)}
+            <span>Misiones</span>
+          </button>
+
+          <button class="nav-item" data-page="progress">
+            ${icon('chart-no-axes-combined', 20)}
+            <span>Mi progreso</span>
+          </button>
+
+          <button type="button" class="nav-item mobile-logout-item"
+            onclick="logout()" aria-label="Cerrar sesión">
+            ${icon('log-out', 20)}
+            <span>Cerrar sesión</span>
+          </button>
+
+        </nav>
+
+        <div class="sidebar-bottom">
+          <div class="sidebar-profile">
+
+            <div class="avatar">${getInitials(name)}</div>
+
+            <div class="profile-info">
+              <div class="profile-name">${name}</div>
+              <div class="profile-grade">${grade}</div>
+            </div>
+
+            <button class="logout-button"
+              onclick="logout()" title="Cerrar sesión"
+              aria-label="Cerrar sesión">
+              ${icon('log-out', 19)}
+            </button>
+
+          </div>
+        </div>
+
+      </aside>
+
+      <section class="main-content">
+
+        <header class="topbar">
+
+          <div class="topbar-label">
+            <span class="topbar-status"></span>
+            Plataforma de aprendizaje
+          </div>
+
+          <div class="topbar-profile">
+            <div class="topbar-avatar">${getInitials(name)}</div>
+            <div>
+              <strong>${name}</strong>
+              <span>${grade}</span>
+            </div>
+          </div>
+
+        </header>
+
+        <section class="page-content" id="page-content"></section>
+
+        <footer class="app-footer">
+          Aprende+ <span>·</span> English Learning Platform
+        </footer>
+
+      </section>
+
+    </div>
+  `;
+
+  ensureMobileLogoutStyles();
+
+  document.querySelectorAll('[data-page]').forEach(function(button) {
+    button.addEventListener('click', function() {
+      navigate(button.dataset.page);
+    });
+  });
+
+  refreshIcons();
+}
+
+
+/* =========================================
+   NAVEGACIÓN
+========================================= */
+
+function navigate(page) {
+  stopListeningAudio();
+  resetRecording();
+
+  App.currentPage = page;
+
+  document.querySelectorAll('.nav-item[data-page]')
+    .forEach(function(button) {
+      button.classList.toggle('active', button.dataset.page === page);
+    });
+
+  if (page === 'home') renderHome();
+  else if (page === 'missions') renderMissions();
+  else if (page === 'progress') renderProgress();
+
+  window.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+
+/* =========================================
+   INICIO
+========================================= */
+
+function renderHome() {
+  const dashboard = App.dashboard || {};
+  const average = dashboard.average || 0;
+  const total = dashboard.totalActivities || 0;
+  const name = escapeHTML(App.student.name.split(' ')[0]);
+  const badges = (dashboard.badges || []).length;
+
+  document.getElementById('page-content').innerHTML = `
+
+    <header class="page-header">
+      <div>
+        <span class="page-eyebrow">TU ESPACIO PERSONAL</span>
+        <h1 class="page-title">Hola, ${name}</h1>
+        <p class="page-subtitle">
+          Este es tu espacio para aprender y mejorar tu inglés.
+        </p>
+      </div>
+
+      <div class="header-date">
+        ${icon('calendar-days', 17)}
+        <span>${new Date().toLocaleDateString('es-SV', {
+          day: 'numeric',
+          month: 'long',
+          year: 'numeric'
+        })}</span>
+      </div>
+    </header>
+
+    <section class="welcome-banner">
+
+      <div class="welcome-content">
+        <span class="welcome-eyebrow">YOUR NEXT CHAPTER STARTS HERE</span>
+
+        <h2>Ready to learn<br><span>English?</span></h2>
+
+        <p>
+          Cada actividad es una oportunidad para mejorar.
+          Practica tus habilidades y alcanza nuevas metas.
+        </p>
+
+        <button class="btn btn-white mt-20"
+          onclick="navigate('missions')">
+          <span>Explorar misiones</span>
+          ${icon('arrow-up-right', 18)}
+        </button>
+      </div>
+
+      <div class="welcome-decoration">
+        <div class="welcome-circle welcome-circle-one"></div>
+        <div class="welcome-circle welcome-circle-two"></div>
+        <div class="welcome-book">${icon('graduation-cap', 88)}</div>
+        <div class="welcome-floating welcome-floating-one">${icon('book-open', 23)}</div>
+        <div class="welcome-floating welcome-floating-two">${icon('headphones', 23)}</div>
+      </div>
+
+    </section>
+
+    <section class="dashboard-grid">
+
+      <div class="stat-card stat-blue">
+        <div class="stat-top">
+          <span class="stat-icon">${icon('book-open-check', 23)}</span>
+          <span class="stat-caption">ACTIVIDAD</span>
+        </div>
+        <div class="stat-value">${total}</div>
+        <div class="stat-label">Actividades completadas</div>
+      </div>
+
+      <div class="stat-card stat-purple">
+        <div class="stat-top">
+          <span class="stat-icon">${icon('chart-no-axes-combined', 23)}</span>
+          <span class="stat-caption">RENDIMIENTO</span>
+        </div>
+        <div class="stat-value">${average}%</div>
+        <div class="stat-label">Promedio general</div>
+      </div>
+
+      <div class="stat-card stat-orange">
+        <div class="stat-top">
+          <span class="stat-icon">${icon('award', 23)}</span>
+          <span class="stat-caption">LOGROS</span>
+        </div>
+        <div class="stat-value">${badges}</div>
+        <div class="stat-label">Insignias obtenidas</div>
+      </div>
+
+    </section>
+
+    <div class="section-heading">
+      <div>
+        <span class="page-eyebrow">TU RENDIMIENTO</span>
+        <h2 class="section-title">Tus habilidades</h2>
+        <p class="page-subtitle">
+          Tu desempeño en las cuatro áreas del inglés.
+        </p>
+      </div>
+    </div>
+
+    <section class="card skill-progress-card">
+      ${renderSkillProgress(dashboard.skillProgress || {})}
+    </section>
+
+    <div class="section-heading section-heading-spaced">
+      <div>
+        <span class="page-eyebrow">SIGUE APRENDIENDO</span>
+        <h2 class="section-title">Comienza a practicar</h2>
+        <p class="page-subtitle">Explora las actividades disponibles.</p>
+      </div>
+
+      <button class="btn btn-light" onclick="navigate('missions')">
+        <span>Ver todas</span>
+        ${icon('arrow-right', 17)}
+      </button>
+    </div>
+
+    <section class="activities-grid">
+      ${App.activities.slice(0, 4).map(renderActivityCard).join('')}
+    </section>
+
+  `;
+
+  refreshIcons();
+}
+
+
+/* =========================================
+   PROGRESO POR HABILIDAD
+========================================= */
+
+function renderSkillProgress(progress) {
+  const skills = ['Listening', 'Speaking', 'Reading', 'Writing'];
+
+  return `
+    <div class="skill-progress-grid">
+      ${skills.map(function(skill) {
+        const score = Math.min(100, Math.max(0, Number(progress[skill]) || 0));
+
+        return `
+          <div class="progress-item">
+
+            <div class="progress-skill-heading">
+              ${skillIconHTML(skill, 21)}
+
+              <div class="progress-skill-name">
+                <strong>${skill}</strong>
+                <span>Dominio de habilidad</span>
+              </div>
+
+              <strong class="progress-percentage">${score}%</strong>
+            </div>
+
+            <div class="progress-track">
+              <div class="progress-fill ${getSkillClass(skill)}"
+                style="width:${score}%"></div>
+            </div>
+
+          </div>
+        `;
+      }).join('')}
+    </div>
+  `;
+}
+
+
+/* =========================================
+   TARJETAS DE ACTIVIDADES
+========================================= */
+
+function renderActivityCard(activity) {
+  const skills = getActivitySkills(activity);
+  const firstSkill = skills[0] || activity.skill;
+  const completion = getActivityCompletion(activity);
+
+  const tags = skills.map(function(skill) {
+    const done = Boolean(getSkillResult(activity.id, skill));
+
+    return `
+      <span class="skill-tag ${getSkillClass(skill)}">
+        ${escapeHTML(skill)}
+        ${done ? ' ✓' : ''}
+      </span>
+    `;
+  }).join('');
+
+  let actionText = 'Comenzar';
+
+  if (completion.isComplete) actionText = 'Ver resultados';
+  else if (completion.completed > 0) actionText = 'Continuar';
+
+  return `
+    <article class="activity-card">
+
+      <div class="activity-top">
+        <div class="activity-icon ${getSkillClass(firstSkill)}">
+          ${icon(getSkillIcon(firstSkill), 25)}
+        </div>
+
+        <div class="activity-tags">${tags}</div>
+      </div>
+
+      <h3 class="activity-title">${escapeHTML(activity.title)}</h3>
+
+      <p class="activity-description">
+        ${escapeHTML(activity.description)}
+      </p>
+
+      <div class="activity-card-footer">
+
+        <span class="activity-level">
+          ${icon('signal', 15)}
+          ${completion.completed}/${completion.total} habilidades
+        </span>
+
+        <button class="btn btn-card"
+          onclick="openActivity('${escapeHTML(activity.id)}')">
+          <span>${actionText}</span>
+          ${icon('arrow-up-right', 17)}
+        </button>
+
+      </div>
+
+    </article>
+  `;
+}
+
+
+/* =========================================
+   MISIONES
+========================================= */
+
+function renderMissions() {
+  const filters = ['Todos', 'Listening', 'Speaking', 'Reading', 'Writing'];
+
+  const filtered = App.currentFilter === 'Todos'
+    ? App.activities
+    : App.activities.filter(function(activity) {
+        return getActivitySkills(activity).includes(App.currentFilter);
+      });
+
+  document.getElementById('page-content').innerHTML = `
+
+    <header class="page-header">
+      <div>
+        <span class="page-eyebrow">EXPLORA Y PRACTICA</span>
+        <h1 class="page-title">Misiones</h1>
+        <p class="page-subtitle">
+          Elige una actividad y pon a prueba tu inglés.
+        </p>
+      </div>
+
+      <div class="mission-counter">
+        ${icon('layers', 19)}
+        <strong>${App.activities.length}</strong>
+        <span>actividades disponibles</span>
+      </div>
+    </header>
+
+    <section class="mission-intro">
+      <div class="mission-intro-icon">${icon('target', 27)}</div>
+      <div>
+        <h2>Tu próxima meta comienza aquí</h2>
+        <p>
+          Practica las cuatro habilidades y desarrolla tu dominio del inglés.
+        </p>
+      </div>
+    </section>
+
+    <div class="filters">
+      ${filters.map(function(filter) {
+        const filterIcon = filter === 'Todos'
+          ? 'grid-2x2'
+          : getSkillIcon(filter);
+
+        return `
+          <button class="filter-btn ${App.currentFilter === filter ? 'active' : ''}"
+            onclick="setFilter('${filter}')">
+            ${icon(filterIcon, 17)}
+            <span>${filter}</span>
+          </button>
+        `;
+      }).join('')}
+    </div>
+
+    <div class="mission-results-heading">
+      <h2 class="section-title">
+        ${App.currentFilter === 'Todos' ? 'Todas las actividades' : App.currentFilter}
+      </h2>
+      <span>${filtered.length} disponibles</span>
+    </div>
+
+    <section class="activities-grid">
+      ${filtered.length
+        ? filtered.map(renderActivityCard).join('')
+        : `
+          <div class="card empty-state">
+            ${icon('folder-open', 40)}
+            <h3>No hay actividades disponibles</h3>
+            <p>Prueba seleccionando otra categoría.</p>
+          </div>
+        `
+      }
+    </section>
+
+  `;
+
+  refreshIcons();
+}
+
+function setFilter(filter) {
+  App.currentFilter = filter;
+  renderMissions();
+}
+
+
+/* =========================================
+   ABRIR ACTIVIDAD
+========================================= */
+
+function openActivity(activityId) {
+  const page = document.getElementById('page-content');
+
+  stopListeningAudio();
+  resetRecording();
+
+  page.innerHTML = `
+    <div class="empty-state activity-loading">
+      <div class="loader" style="margin:auto"></div>
+      <p class="mt-20">Cargando actividad...</p>
+    </div>
+  `;
+
+  serverCall(
+    'getActivity',
+    [App.token, activityId],
+    function(result) {
+      if (!result || !result.id) {
+        showToast(result && result.message
+          ? result.message
+          : 'No fue posible cargar la actividad.', 'error');
+        navigate('missions');
+        return;
+      }
+
+      App.currentActivity = result;
+
+      loadActivityResults(function() {
+        renderActivity(App.currentActivity);
+      });
+    }
+  );
+}
+
+
+/* =========================================
+   MOSTRAR ACTIVIDAD
+========================================= */
+
+function renderActivity(activity) {
+  const page = document.getElementById('page-content');
+  const skills = getActivitySkills(activity);
+  const completion = getActivityCompletion(activity);
+
+  if (completion.isComplete) {
+    showCombinedResult(activity);
+    return;
+  }
+
+  const firstSkill = skills[0] || activity.skill;
+
+  const skillSections = skills.map(function(skill) {
+    const part = getActivityPart(activity, skill);
+    const savedResult = getSkillResult(activity.id, skill);
+
+    return savedResult
+      ? renderCompletedPart(skill, savedResult)
+      : renderPendingPart(activity, skill, part);
+  }).join('');
+
+  page.innerHTML = `
+
+    <div class="activity-container">
+
+      <button class="btn btn-light back-button mb-20"
+        onclick="navigate('missions')">
+        ${icon('arrow-left', 18)}
+        <span>Volver a misiones</span>
+      </button>
+
+      <header class="activity-page-heading">
+
+        <div class="activity-page-icon ${getSkillClass(firstSkill)}">
+          ${icon(getSkillIcon(firstSkill), 29)}
+        </div>
+
+        <div>
+          <div class="activity-tags">
+            ${skills.map(skill => `
+              <span class="skill-tag ${getSkillClass(skill)}">
+                ${escapeHTML(skill)}
+              </span>
+            `).join('')}
+          </div>
+
+          <h1 class="page-title">${escapeHTML(activity.title)}</h1>
+
+          <p class="page-subtitle">
+            ${escapeHTML(activity.description)}
+          </p>
+        </div>
+
+      </header>
+
+      <div class="activity-instructions">
+        <div class="instructions-icon">${icon('info', 20)}</div>
+
+        <div>
+          <strong>Instrucciones</strong>
+          <p>
+            Completa las dos partes de esta actividad.
+            Cada habilidad se evalúa y guarda de manera independiente.
+          </p>
+        </div>
+      </div>
+
+      <div class="activity-progress-summary">
+        <strong>Tu avance en esta actividad</strong>
+        <span>${completion.completed} de ${completion.total} habilidades completadas</span>
+      </div>
+
+      ${skillSections}
+
+    </div>
+
+  `;
+
+  refreshIcons();
+}
+
+function renderPendingPart(activity, skill, part) {
+  let content = '';
+
+  if (skill === 'Listening' || skill === 'Reading') {
+    content = renderQuiz(activity, skill, part);
+  } else if (skill === 'Writing') {
+    content = renderWriting(activity, part);
+  } else if (skill === 'Speaking') {
+    content = renderSpeaking(activity, part);
+  }
+
+  return `
+    <section class="activity-skill-section">
+
+      <div class="section-heading">
+        <div>
+          <span class="page-eyebrow">PARTE ${escapeHTML(skill.toUpperCase())}</span>
+          <h2 class="section-title">
+            ${skillIconHTML(skill, 22)}
+            ${escapeHTML(skill)}
+          </h2>
+        </div>
+
+        <span class="skill-tag ${getSkillClass(skill)}">Pendiente</span>
+      </div>
+
+      ${part.instructions
+        ? `<p class="page-subtitle">${escapeHTML(part.instructions)}</p>`
+        : ''
+      }
+
+      ${content}
+
+    </section>
+  `;
+}
+
+function feedbackList(items) {
+  if (!Array.isArray(items)) {
+    if (typeof items === 'string' && items.trim()) return [items.trim()];
+    return [];
+  }
+  return items.map(item => String(item || '').trim()).filter(Boolean);
+}
+
+function renderFeedbackPanel(skill, result) {
+  if (!result) return '';
+  const feedback = result.feedback;
+  const isQuiz = skill === 'Listening' || skill === 'Reading';
+
+  if (isQuiz && Array.isArray(feedback)) {
+    const review = feedback.map(function(item, index) {
+      const correct = item && item.correct === true;
+      return `
+        <div class="question-card" style="margin-top:12px;padding:15px;border:1px solid ${correct ? '#ccebdc' : '#f3d0d0'};background:${correct ? '#f3fbf7' : '#fff7f7'}">
+          <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:9px">
+            <strong>Pregunta ${index + 1}</strong>
+            <span style="font-size:12px;font-weight:700;color:${correct ? '#168451' : '#c04444'}">${correct ? 'Correcta' : 'Necesita revisión'}</span>
+          </div>
+          <p style="margin:0 0 9px;font-weight:600">${escapeHTML(item.question || '')}</p>
+          <p style="margin:5px 0;font-size:14px"><strong>Tu respuesta:</strong> ${escapeHTML(item.selected || 'Sin respuesta')}</p>
+          ${!correct ? `<p style="margin:5px 0;font-size:14px"><strong>Respuesta correcta:</strong> ${escapeHTML(item.correctAnswer || '')}</p>` : ''}
+          ${item.explanation ? `<p style="margin:9px 0 0;color:#536176;font-size:13px"><strong>¿Por qué?</strong> ${escapeHTML(item.explanation)}</p>` : ''}
+        </div>`;
+    }).join('');
+    const correctCount = feedback.filter(item => item && item.correct === true).length;
+    const total = feedback.length;
+    return `
+      <div class="question-card" style="margin-top:16px;padding:18px">
+        <h3 style="margin:0 0 6px">Tu retroalimentación</h3>
+        <p class="page-subtitle" style="margin:0">${correctCount} de ${total} respuestas correctas. Revisa cada pregunta para identificar qué necesitas reforzar.</p>
+        ${review}
+      </div>`;
+  }
+
+  const strengths = feedbackList(result.strengths);
+  const improvements = feedbackList(result.improvements);
+  const recommendation = typeof result.recommendation === 'string'
+    ? result.recommendation
+    : feedbackList(result.recommendation).join(' ');
+  const general = typeof feedback === 'string'
+    ? feedback
+    : (feedback && typeof feedback === 'object'
+      ? (feedback.summary || feedback.feedback || feedback.message || '')
+      : '');
+
+  if (!general && !strengths.length && !improvements.length && !recommendation) return '';
+
+  const listHTML = function(items, emptyText) {
+    return items.length
+      ? `<ul style="margin:8px 0 0;padding-left:20px">${items.map(item => `<li style="margin:5px 0">${escapeHTML(item)}</li>`).join('')}</ul>`
+      : `<p style="margin:8px 0 0;color:#68758a;font-size:13px">${emptyText}</p>`;
+  };
+
+  return `
+    <div class="question-card" style="margin-top:16px;padding:18px">
+      <h3 style="margin:0 0 10px">Tu retroalimentación</h3>
+      ${general ? `<p class="page-subtitle" style="margin:0 0 14px">${escapeHTML(general)}</p>` : ''}
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:14px">
+        <div style="padding:13px;border-radius:10px;background:#f1faf5">
+          <strong style="color:#18794e">Lo que hiciste bien</strong>
+          ${listHTML(strengths, 'Sigue practicando para identificar tus fortalezas.')}
+        </div>
+        <div style="padding:13px;border-radius:10px;background:#fff8ed">
+          <strong style="color:#9a6418">Lo que puedes mejorar</strong>
+          ${listHTML(improvements, 'Continúa practicando esta habilidad.')}
+        </div>
+      </div>
+      ${recommendation ? `<div style="margin-top:14px;padding:13px;border-radius:10px;background:#f2f5ff"><strong>Tu siguiente paso</strong><p style="margin:7px 0 0">${escapeHTML(recommendation)}</p></div>` : ''}
+    </div>`;
+}
+
+function renderCompletedPart(skill, result) {
+  const percentage = Number(
+    result.percentage !== undefined
+      ? result.percentage
+      : result.score || 0
+  );
+
+  return `
+    <section class="activity-skill-section completed-skill-section">
+
+      <div class="question-card">
+
+        <div class="content-card-heading">
+
+          <div class="content-card-icon ${getSkillClass(skill)}">
+            ${icon('check-circle', 23)}
+          </div>
+
+          <div>
+            <span class="page-eyebrow">${escapeHTML(skill.toUpperCase())}</span>
+            <h3>Habilidad completada</h3>
+          </div>
+
+          <span class="skill-tag ${getSkillClass(skill)}">Completada</span>
+
+        </div>
+
+        <div class="result-score">
+          <strong>${percentage}%</strong>
+          <span>PUNTUACIÓN</span>
+        </div>
+
+        <p class="page-subtitle">
+          Tu resultado está guardado. Revisa tus aciertos y recomendaciones.
+        </p>
+
+      </div>
+
+      ${renderFeedbackPanel(skill, result)}
+
+    </section>
+  `;
+}
+
+
+/* =========================================
+   LISTENING: REPRODUCCIÓN DE AUDIO
+========================================= */
+
+
+/*
+ * Reproducción de Listening con prioridad para voces
+ * inglesas de mayor calidad disponibles en el navegador.
+ */
+
+
+function stopListeningAudio() {
+  if ('speechSynthesis' in window) {
+    window.speechSynthesis.cancel();
+  }
+
+  App.speechUtterance = null;
+
+  const button = document.getElementById('listen-button');
+
+  if (button) {
+    button.disabled = false;
+    button.innerHTML = `${icon('volume-2', 19)}<span>Escuchar audio</span>`;
+    refreshIcons();
+  }
+}
+
+
+/**
+ * Espera a que el navegador cargue sus voces.
+ */
+function getEnglishVoice() {
+  return new Promise(function(resolve) {
+    const synth = window.speechSynthesis;
+
+    function selectVoice() {
+      const voices = synth.getVoices();
+
+      const englishVoices = voices.filter(voice =>
+        /^en(-|_)/i.test(voice.lang)
+      );
+
+      if (!englishVoices.length) return null;
+
+      function scoreVoice(voice) {
+        const name = voice.name.toLowerCase();
+        const lang = voice.lang.toLowerCase();
+
+        let score = 0;
+
+        if (lang === 'en-us') score += 30;
+        else if (lang === 'en-gb') score += 15;
+
+        if (/natural|neural/.test(name)) score += 100;
+        if (/online/.test(name)) score += 40;
+
+        if (/aria|jenny|guy|sara|ava|andrew|jane/.test(name)) {
+          score += 20;
+        }
+
+        if (voice.localService === false) score += 10;
+
+        return score;
+      }
+
+      englishVoices.sort((a, b) =>
+        scoreVoice(b) - scoreVoice(a)
+      );
+
+      return englishVoices[0];
+    }
+
+    const initialVoice = selectVoice();
+
+    if (initialVoice) {
+      resolve(initialVoice);
+      return;
+    }
+
+    let completed = false;
+
+    function finish() {
+      if (completed) return;
+
+      completed = true;
+      synth.removeEventListener('voiceschanged', finish);
+
+      resolve(selectVoice());
+    }
+
+    synth.addEventListener('voiceschanged', finish);
+
+    // Algunos navegadores tardan en cargar las voces.
+    setTimeout(finish, 2500);
+  });
+}
+
+
+/**
+ * Reproduce el contenido de Listening.
+ */
+async function playListeningAudio() {
+  const activity = App.currentActivity;
+
+  if (!activity) return;
+
+  const part = getActivityPart(activity, 'Listening');
+
+  const textToRead = String(
+    part.audioText ||
+    part.content ||
+    part.prompt ||
+    ''
+  ).trim();
+
+  if (!textToRead) {
+    showToast(
+      'Esta actividad no tiene un texto de audio configurado.',
+      'error'
+    );
+    return;
+  }
+
+  if (!('speechSynthesis' in window)) {
+    showToast(
+      'Tu navegador no admite reproducción de voz.',
+      'error'
+    );
+    return;
+  }
+
+  stopListeningAudio();
+
+  const button = document.getElementById('listen-button');
+
+  if (button) {
+    button.disabled = true;
+    button.innerHTML =
+      `${icon('loader-circle', 19)}<span>Cargando voz...</span>`;
+    refreshIcons();
+  }
+
+  try {
+    const voice = await getEnglishVoice();
+
+    // Evitar reproducir una actividad diferente si el usuario navegó.
+    if (App.currentActivity !== activity) return;
+
+    const utterance = new SpeechSynthesisUtterance(textToRead);
+
+    utterance.lang = voice ? voice.lang : 'en-US';
+    utterance.rate = 0.90;
+    utterance.pitch = 1;
+    utterance.volume = 1;
+
+    if (voice) {
+      utterance.voice = voice;
+      console.log('Voz seleccionada:', voice.name, voice.lang);
+    } else {
+      console.warn(
+        'No hay voces inglesas disponibles.',
+        window.speechSynthesis.getVoices()
+      );
+
+      showToast(
+        'No hay una voz inglesa instalada. Se intentará utilizar la voz predeterminada.',
+        'error'
+      );
+    }
+
+    utterance.onstart = function() {
+      if (button) {
+        button.disabled = false;
+        button.innerHTML =
+          `${icon('volume-2', 19)}<span>Reproduciendo...</span>`;
+        refreshIcons();
+      }
+    };
+
+    utterance.onend = function() {
+      App.speechUtterance = null;
+
+      if (button) {
+        button.disabled = false;
+        button.innerHTML =
+          `${icon('refresh-cw', 19)}<span>Escuchar nuevamente</span>`;
+        refreshIcons();
+      }
+    };
+
+    utterance.onerror = function(event) {
+      console.error('Error de reproducción:', event);
+
+      App.speechUtterance = null;
+
+      if (button) {
+        button.disabled = false;
+        button.innerHTML =
+          `${icon('volume-2', 19)}<span>Volver a escuchar</span>`;
+        refreshIcons();
+      }
+
+      showToast('No fue posible reproducir el audio.', 'error');
+    };
+
+    App.speechUtterance = utterance;
+    window.speechSynthesis.speak(utterance);
+
+  } catch (error) {
+    console.error('Error al cargar la voz:', error);
+
+    if (button) {
+      button.disabled = false;
+      button.innerHTML =
+        `${icon('volume-2', 19)}<span>Volver a escuchar</span>`;
+      refreshIcons();
+    }
+
+    showToast('No fue posible cargar la voz.', 'error');
+  }
+}
+
+
+function renderQuiz(activity, skill, part) {
+  const questions = part.questions || [];
+  const contentText = part.audioText || part.content || part.prompt || '';
+
+  let content = '';
+
+  if (skill === 'Listening') {
+    content += `
+      <div class="question-card learning-content">
+
+        <div class="content-card-heading">
+
+          <div class="content-card-icon">
+            ${icon('headphones', 21)}
+          </div>
+
+          <div>
+            <span class="page-eyebrow">LISTENING PRACTICE</span>
+            <h3>Escucha el diálogo</h3>
+          </div>
+
+        </div>
+
+        <p class="page-subtitle">
+          Presiona el botón para escuchar el contenido en inglés.
+          Puedes reproducirlo varias veces.
+        </p>
+
+        <button
+          id="listen-button"
+          type="button"
+          class="btn btn-primary mt-20"
+          onclick="playListeningAudio()">
+          ${icon('volume-2', 19)}
+          <span>Escuchar audio</span>
+        </button>
+
+        <button
+          type="button"
+          class="btn btn-light mt-20"
+          onclick="stopListeningAudio()">
+          ${icon('square', 17)}
+          <span>Detener audio</span>
+        </button>
+
+      </div>
+    `;
+  } else if (contentText) {
+    content += `
+      <div class="question-card learning-content">
+
+        <div class="content-card-heading">
+
+          <div class="content-card-icon">
+            ${icon('book-open', 21)}
+          </div>
+
+          <div>
+            <span class="page-eyebrow">READING PRACTICE</span>
+            <h3>Texto de lectura</h3>
+          </div>
+
+        </div>
+
+        <p>${escapeHTML(contentText)}</p>
+
+      </div>
+    `;
+  }
+
+  content += `
+    <div class="quiz-hint">
+      ${icon(skill === 'Listening' ? 'headphones' : 'book-open', 18)}
+      <span>
+        ${skill === 'Listening'
+          ? 'Escucha el audio antes de responder las preguntas.'
+          : 'Lee el texto con atención antes de responder.'}
+      </span>
+    </div>
+
+    <div class="quiz-question-list">
+
+      ${questions.map(function(question, index) {
+        return `
+          <div class="question-card">
+
+            <div class="question-number">
+              PREGUNTA ${String(index + 1).padStart(2, '0')}
+            </div>
+
+            <h3 class="question-title">
+              ${escapeHTML(question.question)}
+            </h3>
+
+            <div class="option-list">
+
+              ${(question.options || []).map(function(option, optionIndex) {
+                const value = escapeHTML(option);
+
+                return `
+                  <label class="option-item">
+
+                    <input
+                      type="radio"
+                      name="question-${skill}-${index}"
+                      value="${value}"
+                    >
+
+                    <span class="option-letter">
+                      ${String.fromCharCode(65 + optionIndex)}
+                    </span>
+
+                    <span class="option-text">${value}</span>
+
+                  </label>
+                `;
+              }).join('')}
+
+            </div>
+
+          </div>
+        `;
+      }).join('')}
+
+    </div>
+
+    <button class="btn btn-primary btn-block quiz-submit mt-20"
+      id="quiz-submit-${skill}"
+      onclick="submitQuizAnswers('${skill}')">
+      <span>Enviar respuestas</span>
+      ${icon('arrow-right', 19)}
+    </button>
+  `;
+
+  return content;
+}
+
+function submitQuizAnswers(skill) {
+  const activity = App.currentActivity;
+  const part = getActivityPart(activity, skill);
+  const questions = part.questions || [];
+  const answers = [];
+
+  if (!questions.length) {
+    showToast('Esta parte todavía no tiene preguntas configuradas.', 'error');
+    return;
+  }
+
+  for (let i = 0; i < questions.length; i++) {
+    const selected = document.querySelector(
+      'input[name="question-' + skill + '-' + i + '"]:checked'
+    );
+
+    if (!selected) {
+      showToast('Responde todas las preguntas antes de continuar.', 'error');
+      return;
+    }
+
+    answers.push(selected.value);
+  }
+
+  const button = document.getElementById('quiz-submit-' + skill);
+  button.disabled = true;
+  button.innerHTML = `<span>Evaluando...</span>${icon('loader-circle', 19)}`;
+  refreshIcons();
+
+  stopListeningAudio();
+
+  serverCall(
+    'submitQuiz',
+    [App.token, activity.id, answers, skill],
+    function(result) {
+      if (!result || !result.success) {
+        button.disabled = false;
+        button.innerHTML = `<span>Enviar respuestas</span>${icon('arrow-right', 19)}`;
+        refreshIcons();
+        showToast(result ? result.message : 'No fue posible evaluar las respuestas.', 'error');
+        return;
+      }
+
+      saveLocalActivityResult(activity.id, skill, result);
+
+      refreshDashboard(function() {
+        renderActivity(activity);
+      });
+
+      showToast(skill + ' completado correctamente.', 'success');
+    },
+    function() {
+      button.disabled = false;
+      button.innerHTML = `<span>Enviar respuestas</span>${icon('arrow-right', 19)}`;
+      refreshIcons();
+    }
+  );
+}
+
+
+/* =========================================
+   WRITING
+========================================= */
+
+function renderWriting(activity, part) {
+  const prompt = part.prompt || part.content || part.instructions || '';
+
+  return `
+    <div class="question-card writing-card">
+
+      <div class="content-card-heading">
+
+        <div class="content-card-icon tag-writing">
+          ${icon('pen-line', 22)}
+        </div>
+
+        <div>
+          <span class="page-eyebrow">WRITING PRACTICE</span>
+          <h3>Write your answer in English</h3>
+        </div>
+
+      </div>
+
+      <div class="writing-prompt">
+        <strong>Tu consigna</strong>
+        <p>${escapeHTML(prompt)}</p>
+      </div>
+
+      <label class="form-label" for="writing-answer">
+        Tu respuesta
+      </label>
+
+      <textarea
+        id="writing-answer"
+        class="answer-input"
+        placeholder="Write your answer here..."
+        maxlength="5000"
+      ></textarea>
+
+      <div class="writing-helper">
+        ${icon('sparkles', 16)}
+        <span>
+          La inteligencia artificial evaluará tu gramática,
+          vocabulario y coherencia.
+        </span>
+      </div>
+
+    </div>
+
+    <button id="submit-writing-button"
+      class="btn btn-primary btn-block mt-20"
+      onclick="submitWriting()">
+      <span>Evaluar mi escritura</span>
+      ${icon('arrow-right', 19)}
+    </button>
+  `;
+}
+
+function submitWriting() {
+  const activity = App.currentActivity;
+  const answerElement = document.getElementById('writing-answer');
+  const answer = answerElement ? answerElement.value.trim() : '';
+
+  if (answer.length < 10) {
+    showToast('Escribe una respuesta un poco más extensa.', 'error');
+    return;
+  }
+
+  const button = document.getElementById('submit-writing-button');
+  button.disabled = true;
+  button.innerHTML = `<span>Evaluando con IA...</span>${icon('loader-circle', 19)}`;
+  refreshIcons();
+
+  serverCall(
+    'evaluateWriting',
+    [App.token, activity.id, answer],
+    function(result) {
+      if (!result || !result.success) {
+        button.disabled = false;
+        button.innerHTML = `<span>Evaluar mi escritura</span>${icon('arrow-right', 19)}`;
+        refreshIcons();
+        showToast(result ? result.message : 'No fue posible evaluar tu escritura.', 'error');
+        return;
+      }
+
+      saveLocalActivityResult(activity.id, 'Writing', result);
+
+      refreshDashboard(function() {
+        renderActivity(activity);
+      });
+
+      showToast('Writing completado correctamente.', 'success');
+    },
+    function() {
+      button.disabled = false;
+      button.innerHTML = `<span>Evaluar mi escritura</span>${icon('arrow-right', 19)}`;
+      refreshIcons();
+    }
+  );
+}
+
+
+/* =========================================
+   SPEAKING: GRABACIÓN DE AUDIO
+========================================= */
+
+function renderSpeaking(activity, part) {
+  const prompt = part.prompt || part.content || part.instructions || '';
+
+  return `
+    <div class="question-card speaking-prompt-card">
+
+      <div class="content-card-heading">
+
+        <div class="content-card-icon tag-speaking">
+          ${icon('message-circle', 22)}
+        </div>
+
+        <div>
+          <span class="page-eyebrow">SPEAKING PRACTICE</span>
+          <h3>Tu consigna</h3>
+        </div>
+
+      </div>
+
+      <p class="speaking-prompt">${escapeHTML(prompt)}</p>
+
+    </div>
+
+    <div class="recording-box">
+
+      <div class="recording-visual">
+        ${icon('mic', 34)}
+      </div>
+
+      <span class="page-eyebrow">VOICE RECORDING</span>
+
+      <h3 class="card-title">Graba tu respuesta</h3>
+
+      <p class="card-description">
+        Se abrirá el grabador de Aprende+ en otra pestaña.
+        Allí podrás activar el micrófono, grabar y escuchar tu respuesta.
+      </p>
+
+      <p id="recorder-status" class="recording-status">
+        Esperando para comenzar...
+      </p>
+
+      <div class="recording-actions">
+
+        <button
+          id="open-recorder-button"
+          type="button"
+          class="btn btn-primary"
+          onclick="openRecorder()">
+
+          ${icon('mic', 18)}
+          <span>Activar micrófono y grabar</span>
+
+        </button>
+
+      </div>
+
+    </div>
+  `;
+}
+
+function setRecordingStatus(message) {
+  const status = document.getElementById('recording-status');
+  if (status) status.textContent = message;
+}
+
+async function startRecording() {
+  const recordButton = document.getElementById('record-button');
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    showToast(
+      'El navegador no permite usar el micrófono en esta página. Abre la aplicación mediante HTTPS en Chrome o Edge.',
+      'error'
+    );
+    setRecordingStatus('No se puede acceder al micrófono desde este navegador.');
+    return;
+  }
+
+  if (typeof MediaRecorder === 'undefined') {
+    showToast('Tu navegador no admite grabación de audio.', 'error');
+    return;
+  }
+
+  if (!window.isSecureContext) {
+    showToast('El micrófono requiere una conexión segura HTTPS.', 'error');
+    setRecordingStatus('La conexión no es segura. Se necesita HTTPS.');
+    return;
+  }
+
+  if (recordButton) {
+    recordButton.disabled = true;
+    recordButton.innerHTML = `${icon('loader-circle', 18)}<span>Solicitando permiso...</span>`;
+    refreshIcons();
+  }
+
+  try {
+    /*
+     * Esta solicitud se ejecuta directamente como consecuencia
+     * del clic del estudiante en el botón de grabación.
+     */
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      }
+    });
+
+    App.recordingStream = stream;
+    App.audioChunks = [];
+    App.audioBlob = null;
+    App.recordingSkill = 'Speaking';
+
+    const mimeTypes = [
+      'audio/webm;codecs=opus',
+      'audio/webm',
+      'audio/mp4'
+    ];
+
+    const mimeType = mimeTypes.find(type =>
+      MediaRecorder.isTypeSupported(type)
+    );
+
+    const recorder = mimeType
+      ? new MediaRecorder(stream, { mimeType })
+      : new MediaRecorder(stream);
+
+    App.recorder = recorder;
+
+    recorder.ondataavailable = function(event) {
+      if (event.data && event.data.size > 0) {
+        App.audioChunks.push(event.data);
+      }
+    };
+
+    recorder.onerror = function(event) {
+      console.error('Error de MediaRecorder:', event);
+      showToast('Se produjo un error durante la grabación.', 'error');
+      resetRecording();
+    };
+
+    recorder.onstop = function() {
+      const finalType = recorder.mimeType || 'audio/webm';
+
+      App.audioBlob = new Blob(App.audioChunks, {
+        type: finalType
+      });
+
+      if (App.recordingStream) {
+        App.recordingStream.getTracks().forEach(track => track.stop());
+        App.recordingStream = null;
+      }
+
+      if (App.audioUrl) {
+        URL.revokeObjectURL(App.audioUrl);
+      }
+
+      App.audioUrl = URL.createObjectURL(App.audioBlob);
+
+      const preview = document.getElementById('audio-preview');
+
+      if (preview) {
+        preview.innerHTML = `
+          <audio controls style="width:100%" preload="metadata">
+            <source src="${App.audioUrl}" type="${escapeHTML(finalType)}">
+            Tu navegador no puede reproducir este audio.
+          </audio>
+        `;
+      }
+
+      const evaluateButton = document.getElementById('evaluate-speaking-button');
+      if (evaluateButton) evaluateButton.disabled = App.audioBlob.size === 0;
+
+      const status = document.getElementById('recording-status');
+
+      if (status) {
+        status.textContent = App.audioBlob.size > 0
+          ? 'Grabación lista. Escúchala antes de enviarla.'
+          : 'No se capturó audio. Intenta grabar nuevamente.';
+      }
+
+      const stopButton = document.getElementById('stop-button');
+      const startButton = document.getElementById('record-button');
+
+      if (stopButton) stopButton.classList.add('hidden');
+
+      if (startButton) {
+        startButton.classList.remove('hidden');
+        startButton.disabled = false;
+        startButton.innerHTML = `${icon('refresh-cw', 18)}<span>Grabar nuevamente</span>`;
+      }
+
+      refreshIcons();
+    };
+
+    recorder.start();
+
+    if (recordButton) {
+      recordButton.classList.add('hidden');
+    }
+
+    const stopButton = document.getElementById('stop-button');
+    if (stopButton) stopButton.classList.remove('hidden');
+
+    setRecordingStatus('Grabando... habla en inglés.');
+    const status = document.getElementById('recording-status');
+    if (status) status.classList.add('recording-active');
+
+  } catch (error) {
+    console.error('Error al acceder al micrófono:', error);
+
+    if (App.recordingStream) {
+      App.recordingStream.getTracks().forEach(track => track.stop());
+      App.recordingStream = null;
+    }
+
+    if (recordButton) {
+      recordButton.disabled = false;
+      recordButton.innerHTML = `${icon('mic', 18)}<span>Intentar nuevamente</span>`;
+      refreshIcons();
+    }
+
+    let message = 'No se pudo acceder al micrófono.';
+
+    switch (error.name) {
+      case 'NotAllowedError':
+      case 'PermissionDeniedError':
+        message = 'Permiso denegado. Autoriza el micrófono en los permisos del sitio desde tu navegador.';
+        break;
+
+      case 'NotFoundError':
+      case 'DevicesNotFoundError':
+        message = 'No se encontró ningún micrófono conectado al dispositivo.';
+        break;
+
+      case 'NotReadableError':
+      case 'TrackStartError':
+        message = 'El micrófono está siendo utilizado por otra aplicación o no está disponible.';
+        break;
+
+      case 'OverconstrainedError':
+        message = 'El micrófono no admite la configuración solicitada.';
+        break;
+
+      case 'SecurityError':
+        message = 'El navegador bloqueó el acceso al micrófono por razones de seguridad.';
+        break;
+
+      case 'AbortError':
+        message = 'La solicitud del micrófono fue interrumpida. Intenta nuevamente.';
+        break;
+    }
+
+    setRecordingStatus(message);
+    showToast(message, 'error');
+  }
+}
+
+function stopRecording() {
+  const recorder = App.recorder;
+
+  if (recorder && recorder.state !== 'inactive') {
+    recorder.stop();
+  }
+
+  const status = document.getElementById('recording-status');
+  if (status) status.classList.remove('recording-active');
+}
+
+async function submitSpeaking() {
+  if (!App.audioBlob || App.audioBlob.size === 0) {
+    showToast('Primero debes grabar tu respuesta.', 'error');
+    return;
+  }
+
+  if (App.audioBlob.size > 8 * 1024 * 1024) {
+    showToast('El audio es demasiado grande. Graba una respuesta más corta.', 'error');
+    return;
+  }
+
+  const button = document.getElementById('evaluate-speaking-button');
+  if (!button) return;
+
+  button.disabled = true;
+  button.innerHTML = `<span>Evaluando con IA...</span>${icon('loader-circle', 19)}`;
+  refreshIcons();
+
+  try {
+    const base64 = await new Promise(function(resolve, reject) {
+      const reader = new FileReader();
+
+      reader.onload = function() {
+        resolve(reader.result.split(',')[1]);
+      };
+
+      reader.onerror = reject;
+      reader.readAsDataURL(App.audioBlob);
+    });
+
+    const mimeType = App.audioBlob.type || 'audio/webm';
+
+    serverCall(
+      'evaluateSpeaking',
+      [
+        App.token,
+        App.currentActivity.id,
+        base64,
+        mimeType
+      ],
+      function(result) {
+        if (!result || !result.success) {
+          button.disabled = false;
+          button.innerHTML = `<span>Evaluar mi pronunciación</span>${icon('arrow-right', 19)}`;
+          refreshIcons();
+          showToast(result ? result.message : 'No fue posible evaluar el audio.', 'error');
+          return;
+        }
+
+        saveLocalActivityResult(App.currentActivity.id, 'Speaking', result);
+
+        resetRecording();
+
+        refreshDashboard(function() {
+          renderActivity(App.currentActivity);
+        });
+
+        showToast('Speaking completado correctamente.', 'success');
+      },
+      function() {
+        button.disabled = false;
+        button.innerHTML = `<span>Evaluar mi pronunciación</span>${icon('arrow-right', 19)}`;
+        refreshIcons();
+      }
+    );
+
+  } catch (error) {
+    console.error(error);
+    button.disabled = false;
+    button.innerHTML = `<span>Evaluar mi pronunciación</span>${icon('arrow-right', 19)}`;
+    refreshIcons();
+    showToast('No fue posible procesar la grabación.', 'error');
+  }
+}
+
+function resetRecording() {
+  const recorder = App.recorder;
+
+  /*
+   * Se eliminan los eventos antes de detener una grabación
+   * que ya no corresponde a la pantalla actual.
+   */
+  if (recorder) {
+    recorder.ondataavailable = null;
+    recorder.onstop = null;
+    recorder.onerror = null;
+
+    if (recorder.state !== 'inactive') {
+      try {
+        recorder.stop();
+      } catch (error) {
+        console.warn(error);
+      }
+    }
+  }
+
+  if (App.recordingStream) {
+    App.recordingStream.getTracks().forEach(track => track.stop());
+  }
+
+  if (App.audioUrl) {
+    URL.revokeObjectURL(App.audioUrl);
+  }
+
+  App.recorder = null;
+  App.audioChunks = [];
+  App.audioBlob = null;
+  App.audioUrl = null;
+  App.recordingStream = null;
+  App.recordingSkill = null;
+}
+
+
+/* =========================================
+   RESULTADO CONJUNTO
+========================================= */
+
+function showCombinedResult(activity) {
+  const page = document.getElementById('page-content');
+  const skills = getActivitySkills(activity);
+
+  const results = skills.map(skill => ({
+    skill: skill,
+    result: getSkillResult(activity.id, skill)
+  }));
+
+  const scores = results.map(item => {
+    const result = item.result || {};
+    return Number(
+      result.percentage !== undefined
+        ? result.percentage
+        : result.score || 0
+    );
+  });
+
+  const average = scores.length
+    ? Math.round(scores.reduce((sum, score) => sum + score, 0) / scores.length)
+    : 0;
+
+  page.innerHTML = `
+
+    <div class="activity-container">
+
+      <button class="btn btn-light back-button mb-20"
+        onclick="navigate('missions')">
+        ${icon('arrow-left', 18)}
+        <span>Volver a misiones</span>
+      </button>
+
+      <div class="result-card card">
+
+        <div class="result-success-icon">
+          ${icon('award', 48)}
+        </div>
+
+        <span class="page-eyebrow">ACTIVIDAD FINALIZADA</span>
+
+        <h1 class="page-title mt-20">¡Misión completada!</h1>
+
+        <p class="page-subtitle">
+          Has completado las dos habilidades de esta actividad.
+        </p>
+
+        <h2 class="section-title">${escapeHTML(activity.title)}</h2>
+
+        <div class="result-score">
+          <strong>${average}%</strong>
+          <span>PROMEDIO DE LA ACTIVIDAD</span>
+        </div>
+
+        <div class="combined-results-list">
+
+          ${results.map(function(item, index) {
+            const result = item.result || {};
+            const score = scores[index];
+
+            return `
+              <div class="question-card">
+
+                <div class="content-card-heading">
+                  <div class="content-card-icon ${getSkillClass(item.skill)}">
+                    ${icon(getSkillIcon(item.skill), 22)}
+                  </div>
+
+                  <div>
+                    <span class="page-eyebrow">${escapeHTML(item.skill.toUpperCase())}</span>
+                    <h3>Habilidad completada</h3>
+                  </div>
+
+                  <strong class="progress-percentage">${score}%</strong>
+                </div>
+
+              </div>
+              ${renderFeedbackPanel(item.skill, result)}
+            `;
+          }).join('')}
+
+        </div>
+
+        <div class="result-actions">
+
+          <button class="btn btn-primary btn-block"
+            onclick="navigate('missions')">
+            <span>Continuar aprendiendo</span>
+            ${icon('arrow-right', 18)}
+          </button>
+
+          <button class="btn btn-light btn-block"
+            onclick="navigate('progress')">
+            <span>Ver mi progreso</span>
+            ${icon('chart-no-axes-combined', 18)}
+          </button>
+
+        </div>
+
+      </div>
+
+    </div>
+
+  `;
+
+  refreshIcons();
+}
+
+
+/* =========================================
+   ACTUALIZAR INFORMACIÓN Y RESULTADOS
+========================================= */
+
+function refreshDashboard(callback) {
+  serverCall(
+    'getAppData',
+    [App.token],
+    function(result) {
+      if (result && result.success) {
+        App.dashboard = result.dashboard || App.dashboard;
+        App.activities = result.activities || App.activities;
+      }
+
+      loadActivityResults(function() {
+        if (callback) callback();
+      });
+    },
+    function() {
+      if (callback) callback();
+    }
+  );
+}
+
+
+/* =========================================
+   PROGRESO E HISTORIAL
+========================================= */
+
+function renderHistoryFeedback(record) {
+  if (!record) return '';
+  const feedback = record.feedback;
+  const hasDetails = Array.isArray(feedback) || record.strengths?.length || record.improvements?.length || record.recommendation;
+  if (!hasDetails) {
+    const text = typeof feedback === 'string' ? feedback : readableFeedback(feedback);
+    return text ? `<details style="margin:0 0 14px 52px"><summary style="cursor:pointer;color:#4b50c8;font-size:13px;font-weight:600">Ver retroalimentación</summary><p class="page-subtitle">${escapeHTML(text)}</p></details>` : '';
+  }
+  return `<details style="margin:0 0 14px 52px"><summary style="cursor:pointer;color:#4b50c8;font-size:13px;font-weight:600">Ver retroalimentación</summary>${renderFeedbackPanel(record.skill, record)}</details>`;
+}
+
+function renderProgress() {
+  const page = document.getElementById('page-content');
+
+  page.innerHTML = `
+    <header class="page-header">
+      <div>
+        <span class="page-eyebrow">TU EVOLUCIÓN</span>
+        <h1 class="page-title">Mi progreso</h1>
+        <p class="page-subtitle">
+          Revisa tus resultados y tus logros.
+        </p>
+      </div>
+    </header>
+
+    <div class="empty-state">
+      <div class="loader" style="margin:auto"></div>
+      <p class="mt-20">Cargando tu progreso...</p>
+    </div>
+  `;
+
+  serverCall(
+    'getProgress',
+    [App.token],
+    function(result) {
+      if (!result || !result.success) {
+        showToast(result ? result.message : 'No fue posible cargar el progreso.', 'error');
+        return;
+      }
+
+      const dashboard = result.dashboard || {};
+      const records = result.records || [];
+      const badges = dashboard.badges || [];
+
+      App.activityResults = {};
+
+      records.forEach(function(record) {
+        if (!record.activityId || !record.skill) return;
+
+        storeLatestActivityResult(
+          record.activityId,
+          record.skill,
+          record
+        );
+      });
+
+      App.dashboard = dashboard;
+
+      page.innerHTML = `
+
+        <header class="page-header">
+          <div>
+            <span class="page-eyebrow">TU EVOLUCIÓN</span>
+            <h1 class="page-title">Mi progreso</h1>
+            <p class="page-subtitle">
+              Revisa tus resultados y tus logros.
+            </p>
+          </div>
+        </header>
+
+        <section class="dashboard-grid">
+
+          <div class="stat-card stat-blue">
+            <div class="stat-top">
+              <span class="stat-icon">${icon('book-open-check', 23)}</span>
+              <span class="stat-caption">ACTIVIDAD</span>
+            </div>
+            <div class="stat-value">${dashboard.totalActivities || 0}</div>
+            <div class="stat-label">Actividades completadas</div>
+          </div>
+
+          <div class="stat-card stat-purple">
+            <div class="stat-top">
+              <span class="stat-icon">${icon('chart-no-axes-combined', 23)}</span>
+              <span class="stat-caption">RENDIMIENTO</span>
+            </div>
+            <div class="stat-value">${dashboard.average || 0}%</div>
+            <div class="stat-label">Promedio general</div>
+          </div>
+
+          <div class="stat-card stat-orange">
+            <div class="stat-top">
+              <span class="stat-icon">${icon('award', 23)}</span>
+              <span class="stat-caption">LOGROS</span>
+            </div>
+            <div class="stat-value">${badges.length}</div>
+            <div class="stat-label">Insignias obtenidas</div>
+          </div>
+
+        </section>
+
+        <div class="section-heading">
+          <div>
+            <span class="page-eyebrow">DESARROLLO</span>
+            <h2 class="section-title">Dominio de habilidades</h2>
+          </div>
+        </div>
+
+        <section class="card skill-progress-card mb-20">
+          ${renderSkillProgress(dashboard.skillProgress || {})}
+        </section>
+
+        <div class="section-heading">
+          <div>
+            <span class="page-eyebrow">RECONOCIMIENTOS</span>
+            <h2 class="section-title">Mis insignias</h2>
+          </div>
+        </div>
+
+        <section class="badges-grid mb-20">
+
+          ${badges.length
+            ? badges.map(function(badge) {
+                return `
+                  <div class="badge-card">
+                    <div class="badge-icon">${icon('award', 31)}</div>
+                    <div class="badge-name">${escapeHTML(badge.name)}</div>
+                    <div class="badge-description">${escapeHTML(badge.description)}</div>
+                  </div>
+                `;
+              }).join('')
+            : `
+              <div class="card empty-state">
+                ${icon('target', 38)}
+                <p>
+                  Completa actividades para conseguir tus primeras insignias.
+                </p>
+              </div>
+            `
+          }
+
+        </section>
+
+        <div class="section-heading">
+          <div>
+            <span class="page-eyebrow">HISTORIAL</span>
+            <h2 class="section-title">Actividades realizadas</h2>
+          </div>
+        </div>
+
+        <section class="card history-card">
+
+          ${records.length
+            ? records.map(function(record) {
+                const percentage = record.percentage !== undefined
+                  ? record.percentage
+                  : record.score;
+
+                return `
+                  <div class="history-item">
+
+                    <div class="history-icon ${getSkillClass(record.skill)}">
+                      ${icon(getSkillIcon(record.skill), 21)}
+                    </div>
+
+                    <div class="history-info">
+                      <strong>${escapeHTML(record.title || record.activityId)}</strong>
+
+                      <span>
+                        ${escapeHTML(record.skill)}
+                        ${record.date
+                          ? ' · ' + new Date(record.date).toLocaleDateString('es-SV')
+                          : ''
+                        }
+                      </span>
+                    </div>
+
+                    <div class="history-score">
+                      ${Number(percentage || 0)}%
+                    </div>
+
+                  </div>
+                  ${renderHistoryFeedback(record)}
+                `;
+              }).join('')
+            : `
+              <div class="empty-state">
+                ${icon('book-open', 38)}
+                <p>Aún no has completado actividades.</p>
+
+                <button class="btn btn-primary mt-20"
+                  onclick="navigate('missions')">
+                  <span>Comenzar a aprender</span>
+                  ${icon('arrow-right', 17)}
+                </button>
+              </div>
+            `
+          }
+
+        </section>
+
+      `;
+
+      refreshIcons();
+    }
+  );
+}
+
+
+
+/* =========================================
+   MÓDULO DOCENTE
+========================================= */
+
+function toggleTeacherLogin() {
+  const panel = document.getElementById('teacher-login-panel');
+  if (!panel) return;
+  panel.classList.toggle('hidden');
+  const isOpen = !panel.classList.contains('hidden');
+  const toggle = document.querySelector('.teacher-access-toggle');
+  if (toggle) toggle.setAttribute('aria-expanded', String(isOpen));
+  if (isOpen) {
+    const input = document.getElementById('teacher-password');
+    if (input) input.focus();
+  }
+}
+
+function handleTeacherLogin() {
+  const input = document.getElementById('teacher-password');
+  const button = document.getElementById('teacher-login-button');
+  const password = input ? input.value : '';
+
+  if (!password) {
+    showToast('Ingresa la contraseña docente.', 'error');
+    return;
+  }
+
+  button.disabled = true;
+  button.innerHTML = `<span>Verificando...</span>${icon('loader-circle', 18)}`;
+  refreshIcons();
+
+  serverCall('loginTeacher', [password], function(result) {
+    button.disabled = false;
+    button.innerHTML = `<span>Ingresar al panel docente</span>${icon('arrow-right', 18)}`;
+    refreshIcons();
+
+    if (!result || !result.success) {
+      showToast(result ? result.message : 'No fue posible iniciar sesión.', 'error');
+      return;
+    }
+
+    App.teacherToken = result.token;
+    sessionStorage.setItem('aprende_teacher_token', result.token);
+    loadTeacherApplication();
+  }, function() {
+    button.disabled = false;
+    button.innerHTML = `<span>Ingresar al panel docente</span>${icon('arrow-right', 18)}`;
+    refreshIcons();
+  });
+}
+
+function loadTeacherApplication() {
+  showLoading();
+
+  serverCall('getTeacherDashboard', [App.teacherToken], function(result) {
+    if (!result || !result.success) {
+      sessionStorage.removeItem('aprende_teacher_token');
+      App.teacherToken = '';
+      showLogin();
+      showToast(result ? result.message : 'No fue posible validar la sesión docente.', 'error');
+      return;
+    }
+
+    App.teacherData = result;
+    renderTeacherLayout();
+    renderTeacherDashboard();
+    hideLoading();
+  }, function() {
+    sessionStorage.removeItem('aprende_teacher_token');
+    App.teacherToken = '';
+    showLogin();
+  });
+}
+
+function renderTeacherLayout() {
+  document.getElementById('app-content').innerHTML = `
+    <div class="app-layout teacher-app-layout">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-logo" style="position:relative;display:flex;align-items:center;justify-content:center;line-height:1;">
+            <span style="font-size:32px;line-height:1;font-weight:800;">A</span>
+            <span style="position:absolute!important;top:7px!important;right:8px!important;bottom:auto!important;left:auto!important;transform:none!important;font-size:17px!important;line-height:1!important;font-weight:800;color:#8CF0D0;">+</span>
+          </div>
+          <div class="brand-name">Aprende<span>+</span></div>
+        </div>
+        <div class="nav-label">MÓDULO DOCENTE</div>
+        <nav class="nav-menu">
+          <button class="nav-item active" data-teacher-page="dashboard"
+            onclick="renderTeacherDashboard()">
+            ${icon('layout-dashboard', 20)}<span>Resumen del grupo</span>
+          </button>
+          <button class="nav-item" data-teacher-page="students"
+            onclick="renderTeacherStudents()">
+            ${icon('users', 20)}<span>Estudiantes</span>
+          </button>
+          <button class="nav-item" data-teacher-page="create"
+            onclick="renderTeacherCreateStudent()">
+            ${icon('user-plus', 20)}<span>Crear estudiante</span>
+          </button>
+          <button type="button" class="nav-item mobile-logout-item"
+            onclick="logoutTeacher()" aria-label="Cerrar sesión">
+            ${icon('log-out', 20)}<span>Cerrar sesión</span>
+          </button>
+        </nav>
+        <div class="sidebar-bottom">
+          <div class="sidebar-profile">
+            <div class="avatar">${icon('graduation-cap', 20)}</div>
+            <div class="profile-info">
+              <div class="profile-name">Docente</div>
+              <div class="profile-grade">Séptimo grado</div>
+            </div>
+            <button class="logout-button" onclick="logoutTeacher()"
+              title="Cerrar sesión" aria-label="Cerrar sesión">
+              ${icon('log-out', 19)}
+            </button>
+          </div>
+        </div>
+      </aside>
+      <section class="main-content">
+        <header class="topbar">
+          <div class="topbar-label"><span class="topbar-status"></span>Panel de seguimiento académico</div>
+          <div class="topbar-profile">
+            <div class="topbar-avatar">${icon('graduation-cap', 20)}</div>
+            <div><strong>Docente</strong><span>Aprende+ · Séptimo grado</span></div>
+          </div>
+        </header>
+        <section class="page-content" id="page-content"></section>
+        <footer class="app-footer">Aprende+ <span>·</span> Panel docente</footer>
+      </section>
+    </div>
+    <style>
+      .teacher-access{margin-top:22px;padding-top:18px;border-top:1px solid var(--border-color,#e8edf2)}
+      .teacher-access-toggle{display:flex;align-items:center;justify-content:center;gap:9px;width:100%;padding:10px;border:0;background:transparent;color:var(--primary,#315caa);font:inherit;font-weight:600;cursor:pointer}
+      .teacher-login-panel{margin-top:14px;text-align:left}
+      .teacher-kpi-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin-bottom:24px}
+      .teacher-panel{background:#fff;border:1px solid #e8edf2;border-radius:14px;padding:20px;margin-bottom:20px}
+      .teacher-panel h2{font-size:18px;margin:0 0 16px}
+      .teacher-table-wrap{overflow-x:auto}
+      .teacher-table{width:100%;border-collapse:collapse;min-width:620px}
+      .teacher-table th,.teacher-table td{padding:13px 12px;text-align:left;border-bottom:1px solid #edf0f4;font-size:14px}
+      .teacher-table th{color:#687586;font-weight:600;background:#f8fafc}
+      .teacher-table button{border:0;background:transparent;color:#315caa;font-weight:600;cursor:pointer}
+      .teacher-progress{height:8px;background:#edf0f4;border-radius:20px;overflow:hidden;min-width:75px}
+      .teacher-progress span{display:block;height:100%;background:#4d83d5;border-radius:20px}
+      .teacher-skill-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px}
+      .teacher-skill{padding:16px;border:1px solid #edf0f4;border-radius:12px}
+      .teacher-skill strong{display:block;font-size:23px;margin:8px 0 4px}
+      .teacher-skill span{color:#687586;font-size:13px}
+      .teacher-form{max-width:560px}
+      .teacher-form .form-group{margin-bottom:18px}
+      .teacher-empty{padding:28px;text-align:center;color:#687586}
+      .teacher-detail-head{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap}
+      .teacher-status{display:inline-block;padding:5px 9px;border-radius:20px;background:#eef4ff;color:#315caa;font-size:12px;font-weight:600}
+      .teacher-credential{padding:16px;background:#f1f7ff;border:1px solid #d9e8ff;border-radius:12px;margin:16px 0}
+      .teacher-credential strong{display:block;font-size:20px;margin-top:4px}
+      @media(max-width:900px){.teacher-kpi-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.teacher-skill-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+      @media(max-width:520px){.teacher-kpi-grid{grid-template-columns:1fr 1fr;gap:9px}.teacher-kpi-grid .stat-card{padding:14px}.teacher-skill-grid{grid-template-columns:1fr 1fr}}
+    </style>
+  `;
+  ensureMobileLogoutStyles();
+  refreshIcons();
+}
+
+function setTeacherActivePage(page) {
+  document.querySelectorAll('[data-teacher-page]').forEach(function(button) {
+    button.classList.toggle('active', button.dataset.teacherPage === page);
+  });
+}
+
+function refreshTeacherDashboard(callback) {
+  serverCall('getTeacherDashboard', [App.teacherToken], function(result) {
+    if (!result || !result.success) {
+      showToast(result ? result.message : 'No fue posible actualizar los datos.', 'error');
+      if (result && /sesión/i.test(result.message || '')) logoutTeacher();
+      return;
+    }
+    App.teacherData = result;
+    if (callback) callback();
+  });
+}
+
+function renderTeacherDashboard() {
+  setTeacherActivePage('dashboard');
+  const page = document.getElementById('page-content');
+  const data = App.teacherData || {};
+  const summary = data.summary || {};
+  const skills = data.skillAverages || {};
+  const skillNames = ['Listening', 'Speaking', 'Reading', 'Writing'];
+
+  page.innerHTML = `
+    <header class="page-header">
+      <div>
+        <span class="page-eyebrow">SEGUIMIENTO ACADÉMICO</span>
+        <h1 class="page-title">Resumen del grupo</h1>
+        <p class="page-subtitle">Estado general del aprendizaje de séptimo grado.</p>
+      </div>
+      <button class="btn btn-light" onclick="refreshTeacherDashboard(renderTeacherDashboard)">
+        ${icon('refresh-cw',17)}<span>Actualizar</span>
+      </button>
+    </header>
+    <section class="teacher-kpi-grid">
+      <div class="stat-card stat-blue"><div class="stat-top"><span class="stat-caption">MATRÍCULA ACTIVA</span>${icon('users',21)}</div><div class="stat-value">${summary.totalStudents || 0}</div><div class="stat-label">Estudiantes registrados</div></div>
+      <div class="stat-card stat-purple"><div class="stat-top"><span class="stat-caption">PARTICIPACIÓN</span>${icon('activity',21)}</div><div class="stat-value">${summary.studentsWithActivity || 0}</div><div class="stat-label">Con actividad · ${summary.studentsWithoutActivity || 0} sin iniciar</div></div>
+      <div class="stat-card stat-orange"><div class="stat-top"><span class="stat-caption">AVANCE GRUPAL</span>${icon('chart-no-axes-combined',21)}</div><div class="stat-value">${summary.groupProgress || 0}%</div><div class="stat-label">${summary.completedActivities || 0} de ${summary.possibleActivities || 0} actividades</div></div>
+      <div class="stat-card stat-blue"><div class="stat-top"><span class="stat-caption">PROMEDIO</span>${icon('graduation-cap',21)}</div><div class="stat-value">${summary.groupAverage || 0}%</div><div class="stat-label">Entre estudiantes con actividad</div></div>
+    </section>
+    <section class="teacher-panel">
+      <h2>Resultados por habilidad</h2>
+      <div class="teacher-skill-grid">
+        ${skillNames.map(function(skill) {
+          const item = skills[skill] || {};
+          return `<div class="teacher-skill">${skillIconHTML(skill,20)}<strong>${item.evaluations ? item.average + '%' : '—'}</strong><span>${skill} · ${item.evaluations || 0} evaluaciones</span></div>`;
+        }).join('')}
+      </div>
+      <p class="page-subtitle mt-20">${summary.weakestSkill ? 'Habilidad con menor promedio: ' + escapeHTML(summary.weakestSkill) + '.' : 'Aún no hay suficientes resultados para identificar una habilidad con menor promedio.'}</p>
+    </section>
+    <section class="teacher-panel">
+      <div class="teacher-detail-head"><h2>Estudiantes que necesitan refuerzo</h2><span class="teacher-status">${summary.studentsNeedingSupport || 0} estudiantes</span></div>
+      ${(data.studentsNeedingSupport || []).length ? teacherStudentsTable(data.studentsNeedingSupport) : '<div class="teacher-empty">No hay estudiantes con promedio inferior a 70% o todavía no existen resultados.</div>'}
+    </section>
+    <section class="teacher-panel">
+      <div class="teacher-detail-head"><h2>Estudiantes</h2><button class="btn btn-light" onclick="renderTeacherStudents()">Ver todos</button></div>
+      ${teacherStudentsTable((data.students || []).slice(0,8))}
+    </section>
+  `;
+  refreshIcons();
+}
+
+function teacherStudentsTable(students) {
+  if (!students || !students.length) return '<div class="teacher-empty">No hay estudiantes para mostrar.</div>';
+  return `<div class="teacher-table-wrap"><table class="teacher-table">
+    <thead><tr><th>Estudiante</th><th>Código</th><th>Avance</th><th>Promedio</th><th>Estado</th><th></th></tr></thead>
+    <tbody>${students.map(function(student) {
+      return `<tr>
+        <td><strong>${escapeHTML(student.name)}</strong></td>
+        <td>${escapeHTML(student.code)}</td>
+        <td><div class="teacher-progress"><span style="width:${Math.max(0,Math.min(100,Number(student.progress)||0))}%"></span></div><small>${student.progress || 0}%</small></td>
+        <td>${student.totalActivities ? (student.average || 0) + '%' : '—'}</td>
+        <td><span class="teacher-status">${escapeHTML(student.status || '')}</span></td>
+        <td><button onclick="openTeacherStudent('${escapeHTML(student.id)}')">Ver detalle</button></td>
+      </tr>`;
+    }).join('')}</tbody></table></div>`;
+}
+
+function renderTeacherStudents() {
+  setTeacherActivePage('students');
+  const page = document.getElementById('page-content');
+  const students = (App.teacherData && App.teacherData.students) || [];
+  page.innerHTML = `
+    <header class="page-header"><div><span class="page-eyebrow">SEGUIMIENTO</span><h1 class="page-title">Estudiantes</h1><p class="page-subtitle">Consulta el avance y los resultados individuales.</p></div>
+    <button class="btn btn-primary" onclick="renderTeacherCreateStudent()">${icon('user-plus',18)}<span>Crear estudiante</span></button></header>
+    <section class="teacher-panel">${teacherStudentsTable(students)}</section>`;
+  refreshIcons();
+}
+
+function openTeacherStudent(studentId) {
+  const page = document.getElementById('page-content');
+  page.innerHTML = '<div class="empty-state"><div class="loader" style="margin:auto"></div><p class="mt-20">Cargando historial...</p></div>';
+
+  serverCall('getTeacherStudentProgress', [App.teacherToken, studentId], function(result) {
+    if (!result || !result.success) {
+      showToast(result ? result.message : 'No fue posible consultar al estudiante.', 'error');
+      renderTeacherStudents();
+      return;
+    }
+
+    App.selectedTeacherStudent = result;
+    setTeacherActivePage('students');
+    const student = result.student;
+    const dashboard = result.dashboard || {};
+    const records = result.records || [];
+
+    page.innerHTML = `
+      <button class="btn btn-light mb-20" onclick="renderTeacherStudents()">${icon('arrow-left',17)}<span>Volver a estudiantes</span></button>
+      <header class="page-header"><div><span class="page-eyebrow">EXPEDIENTE ACADÉMICO</span><h1 class="page-title">${escapeHTML(student.name)}</h1><p class="page-subtitle">${escapeHTML(student.code)} · ${escapeHTML(student.grade)}</p></div><span class="teacher-status">${student.active ? 'Activo' : 'Inactivo'}</span></header>
+      <section class="teacher-kpi-grid">
+        <div class="stat-card stat-blue"><div class="stat-caption">ACTIVIDADES</div><div class="stat-value">${dashboard.totalActivities || 0}</div><div class="stat-label">Completadas de 12</div></div>
+        <div class="stat-card stat-purple"><div class="stat-caption">PROMEDIO</div><div class="stat-value">${dashboard.average || 0}%</div><div class="stat-label">Rendimiento general</div></div>
+      </section>
+      <section class="teacher-panel"><h2>Progreso por habilidad</h2><div class="teacher-skill-grid">
+        ${['Listening','Speaking','Reading','Writing'].map(function(skill) {
+          const score = (dashboard.skillProgress || {})[skill] || 0;
+          return `<div class="teacher-skill">${skillIconHTML(skill,20)}<strong>${score}%</strong><span>${skill}</span></div>`;
+        }).join('')}
+      </div></section>
+      <section class="teacher-panel"><h2>Historial de evaluaciones</h2>
+        ${records.length ? `<div class="teacher-table-wrap"><table class="teacher-table"><thead><tr><th>Actividad</th><th>Habilidad</th><th>Resultado</th><th>Nivel</th><th>Fecha</th></tr></thead><tbody>
+        ${records.map(function(record) {
+          return `<tr><td>${escapeHTML(record.title)}</td><td>${escapeHTML(record.skill)}</td><td><strong>${record.score}%</strong></td><td>${escapeHTML(record.level)}</td><td>${record.date ? new Date(record.date).toLocaleDateString('es-SV') : '—'}</td></tr>`;
+        }).join('')}</tbody></table></div>` : '<div class="teacher-empty">Este estudiante todavía no tiene evaluaciones registradas.</div>'}
+      </section>`;
+    refreshIcons();
+  });
+}
+
+function renderTeacherCreateStudent() {
+  setTeacherActivePage('create');
+  const page = document.getElementById('page-content');
+  page.innerHTML = `
+    <header class="page-header"><div><span class="page-eyebrow">GESTIÓN DE ESTUDIANTES</span><h1 class="page-title">Crear estudiante</h1><p class="page-subtitle">Registra una cuenta nueva para séptimo grado.</p></div></header>
+    <section class="teacher-panel teacher-form">
+      <div class="form-group"><label class="form-label" for="new-student-name">Nombre completo</label><div class="input-wrapper">${icon('user-round',19)}<input class="form-input" id="new-student-name" type="text" maxlength="80" placeholder="Nombre del estudiante" required></div></div>
+      <div class="form-group"><label class="form-label" for="new-student-pin">PIN de acceso (4 números)</label><div class="input-wrapper">${icon('lock-keyhole',19)}<input class="form-input" id="new-student-pin" type="password" inputmode="numeric" maxlength="4" pattern="[0-9]{4}" placeholder="Ejemplo: 4821" required></div></div>
+      <button class="btn btn-primary" id="create-student-button" onclick="submitCreateStudent()">${icon('user-plus',18)}<span>Registrar estudiante</span></button>
+      <p class="page-subtitle mt-20">El código se genera automáticamente. El PIN se almacena protegido y solo se mostrará al completar el registro.</p>
+      <div id="create-student-result"></div>
+    </section>`;
+  refreshIcons();
+}
+
+function submitCreateStudent() {
+  const name = document.getElementById('new-student-name').value.trim();
+  const pin = document.getElementById('new-student-pin').value.trim();
+  const button = document.getElementById('create-student-button');
+
+  if (name.length < 3) {
+    showToast('Escribe el nombre completo del estudiante.', 'error');
+    return;
+  }
+  if (!/^\d{4}$/.test(pin)) {
+    showToast('El PIN debe contener exactamente cuatro números.', 'error');
+    return;
+  }
+
+  button.disabled = true;
+  button.innerHTML = `<span>Registrando...</span>${icon('loader-circle',18)}`;
+  refreshIcons();
+
+  serverCall('createStudent', [App.teacherToken, name, pin], function(result) {
+    button.disabled = false;
+    button.innerHTML = `${icon('user-plus',18)}<span>Registrar estudiante</span>`;
+    refreshIcons();
+
+    if (!result || !result.success) {
+      showToast(result ? result.message : 'No fue posible registrar al estudiante.', 'error');
+      return;
+    }
+
+    const student = result.student;
+    document.getElementById('create-student-result').innerHTML = `
+      <div class="teacher-credential">
+        <strong>Estudiante registrado</strong>
+        <p>${escapeHTML(student.name)} · ${escapeHTML(student.grade)}</p>
+        <span>Código de acceso</span><strong>${escapeHTML(student.code)}</strong>
+        <span>PIN de acceso</span><strong>${escapeHTML(student.pin)}</strong>
+        <p class="page-subtitle">Entrega estos datos al estudiante. El PIN no volverá a mostrarse.</p>
+        <button class="btn btn-light mt-20" onclick="copyStudentCredentials('${escapeHTML(student.code)}','${escapeHTML(student.pin)}')">${icon('copy',17)}<span>Copiar credenciales</span></button>
+      </div>`;
+    document.getElementById('new-student-name').value = '';
+    document.getElementById('new-student-pin').value = '';
+    refreshTeacherDashboard(function() {});
+    refreshIcons();
+    showToast('Estudiante registrado correctamente.', 'success');
+  }, function() {
+    button.disabled = false;
+    button.innerHTML = `${icon('user-plus',18)}<span>Registrar estudiante</span>`;
+    refreshIcons();
+  });
+}
+
+function copyStudentCredentials(code, pin) {
+  const text = 'Código: ' + code + '\nPIN: ' + pin;
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text)
+      .then(function() { showToast('Credenciales copiadas.', 'success'); })
+      .catch(function() { showToast('No fue posible copiar las credenciales.', 'error'); });
+  } else {
+    showToast(text, 'info');
+  }
+}
+
+function logoutTeacher() {
+  const token = App.teacherToken;
+  App.teacherToken = '';
+  App.teacher = null;
+  App.teacherData = null;
+  App.selectedTeacherStudent = null;
+  sessionStorage.removeItem('aprende_teacher_token');
+
+  serverCall('logoutTeacher', [token], function() {
+    showLogin();
+  }, function() {
+    showLogin();
+  });
+}
+
+
+/* =========================================
+   CERRAR SESIÓN
+========================================= */
+
+function logout() {
+  const token = App.token;
+
+  stopListeningAudio();
+  resetRecording();
+
+  App.token = '';
+  App.student = null;
+  App.activities = [];
+  App.dashboard = null;
+  App.currentActivity = null;
+  App.activityResults = {};
+
+  sessionStorage.removeItem('aprende_token');
+
+  serverCall(
+    'logoutStudent',
+    [token],
+    function() {
+      showLogin();
+    },
+    function() {
+      showLogin();
+    }
+  );
+}
+
+</script>

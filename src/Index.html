@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <base target="_top">
+
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+  <meta name="theme-color" content="#172554">
+
+  <title>Aprende+ | English Learning</title>
+
+  <!-- Tipografías -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=Nunito:wght@400;600;700;800;900&display=swap" rel="stylesheet">
+
+  <!-- Iconografía SVG -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+
+  <!-- Estilos -->
+  <?!= include('Styles'); ?>
+</head>
+
+<body>
+
+  <div id="app">
+
+    <!-- Pantalla de carga -->
+    <section id="loading-screen" class="loading-screen">
+
+      <div class="loading-logo">
+        A<span>+</span>
+      </div>
+
+      <div class="loader"></div>
+
+      <p>Preparando tu espacio de aprendizaje...</p>
+
+    </section>
+
+    <!-- Aplicación -->
+    <main id="main-app" class="hidden">
+
+      <div id="app-content"></div>
+
+    </main>
+
+    <!-- Notificaciones -->
+    <div id="toast-container" class="toast-container"></div>
+
+  </div>
+
+  <!-- Aplicación JavaScript -->
+  <?!= include('App'); ?>
+
+</body>
+</html>
